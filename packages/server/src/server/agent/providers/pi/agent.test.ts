@@ -66,11 +66,13 @@ async function loadPaseoExtensionListeners(
   const extension = (await import(pathToFileURL(extensionPath).href)) as {
     default: (piApi: {
       on: (event: string, listener: PaseoExtensionListener) => void;
+      events: { on: (event: string, listener: PaseoExtensionListener) => void };
       registerCommand: () => void;
     }) => void;
   };
   extension.default({
     on: (event, listener) => listeners.set(event, listener),
+    events: { on: (event, listener) => listeners.set(`event:${event}`, listener) },
     registerCommand: () => undefined,
   });
   return listeners;
@@ -179,6 +181,13 @@ class SessionEvents {
       }
       return [];
     });
+  }
+
+  providerSubagentEvents() {
+    return this.events.filter(
+      (event): event is Extract<AgentStreamEvent, { type: "provider_subagent" }> =>
+        event.type === "provider_subagent",
+    );
   }
 
   eventTypes(): AgentStreamEvent["type"][] {
@@ -1239,6 +1248,163 @@ describe("PiRpcAgentSession", () => {
     expect(notifications).toEqual([
       'PASEO_SUBMITTED_USER_ENTRY {"entry":{"id":"entry-new","parentId":"entry-old-assistant","text":"new prompt"}}',
     ]);
+
+    await session.close();
+  });
+
+  test("bridges Pi async lifecycle events while the root is idle", async () => {
+    const pi = new FakePi();
+    const client = createClient(pi);
+    const session = await client.createSession(createConfig());
+    const extensionPath = pi.recordedLaunches[0]?.extensionPaths[0];
+    expect(extensionPath).toBeDefined();
+    const listeners = await loadPaseoExtensionListeners(extensionPath!);
+    const notifications: string[] = [];
+    const context = {
+      sessionManager: { getEntries: () => [] },
+      ui: { notify: (message: string) => notifications.push(message) },
+    };
+
+    await listeners.get("session_start")?.({}, context);
+    notifications.length = 0;
+    await listeners.get("event:subagent:async-started")?.({
+      id: "async-complete",
+      agent: "reviewer",
+      task: "must not cross the bridge",
+      asyncDir: "/private/run",
+    });
+    await listeners.get("event:subagent:async-started")?.({ id: "async-failed", agent: "worker" });
+    await listeners.get("event:subagent:async-started")?.({
+      id: "async-canceled",
+      agent: "writer",
+    });
+    await listeners.get("event:subagent:async-complete")?.({
+      runId: "async-complete",
+      agent: "reviewer",
+      success: true,
+      processSignal: "SIGTERM",
+      summary: "must not cross the bridge",
+    });
+    await listeners.get("event:subagent:async-complete")?.({
+      runId: "async-failed",
+      agent: "worker",
+      timedOut: true,
+      success: false,
+      error: "must not cross the bridge",
+    });
+    await listeners.get("event:subagent:async-complete")?.({
+      runId: "async-canceled",
+      agent: "writer",
+      interrupted: true,
+      success: false,
+    });
+
+    expect(notifications).toEqual([
+      'PASEO_PI_SUBAGENT {"version":1,"kind":"started","id":"async-complete","status":"running","agent":"reviewer"}',
+      'PASEO_PI_SUBAGENT {"version":1,"kind":"started","id":"async-failed","status":"running","agent":"worker"}',
+      'PASEO_PI_SUBAGENT {"version":1,"kind":"started","id":"async-canceled","status":"running","agent":"writer"}',
+      'PASEO_PI_SUBAGENT {"version":1,"kind":"completed","id":"async-complete","status":"completed","agent":"reviewer"}',
+      'PASEO_PI_SUBAGENT {"version":1,"kind":"completed","id":"async-failed","status":"failed","agent":"worker"}',
+      'PASEO_PI_SUBAGENT {"version":1,"kind":"completed","id":"async-canceled","status":"canceled","agent":"writer"}',
+    ]);
+
+    await session.close();
+  });
+
+  test("does not bridge stale Pi async events after session shutdown", async () => {
+    const pi = new FakePi();
+    const client = createClient(pi);
+    const session = await client.createSession(createConfig());
+    const extensionPath = pi.recordedLaunches[0]?.extensionPaths[0];
+    expect(extensionPath).toBeDefined();
+    const listeners = await loadPaseoExtensionListeners(extensionPath!);
+    const notifications: string[] = [];
+    const context = {
+      sessionManager: { getEntries: () => [] },
+      ui: { notify: (message: string) => notifications.push(message) },
+    };
+
+    await listeners.get("session_start")?.({}, context);
+    notifications.length = 0;
+    await listeners.get("event:subagent:async-started")?.({ id: "async-1", agent: "reviewer" });
+    await listeners.get("session_shutdown")?.({});
+    await listeners.get("event:subagent:async-complete")?.({ runId: "async-1", success: true });
+
+    expect(notifications).toEqual([
+      'PASEO_PI_SUBAGENT {"version":1,"kind":"started","id":"async-1","status":"running","agent":"reviewer"}',
+    ]);
+
+    await session.close();
+  });
+
+  test("maps Pi async lifecycle markers to provider subagents", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    for (const [id, agent] of [
+      ["async-complete", "reviewer"],
+      ["async-failed", "worker"],
+      ["async-canceled", "writer"],
+    ]) {
+      fakeSession.emit({
+        type: "extension_ui_request",
+        id: `${id}-start`,
+        method: "notify",
+        message: `PASEO_PI_SUBAGENT {"version":1,"kind":"started","id":"${id}","status":"running","agent":"${agent}"}`,
+      });
+    }
+    for (const [id, status] of [
+      ["async-complete", "completed"],
+      ["async-failed", "failed"],
+      ["async-canceled", "canceled"],
+    ]) {
+      fakeSession.emit({
+        type: "extension_ui_request",
+        id: `${id}-complete`,
+        method: "notify",
+        message: `PASEO_PI_SUBAGENT {"version":1,"kind":"completed","id":"${id}","status":"${status}"}`,
+      });
+    }
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "async-invalid",
+      method: "notify",
+      message: 'PASEO_PI_SUBAGENT {"version":1,"kind":"started","id":"async-invalid"}',
+    });
+
+    expect(events.providerSubagentEvents()).toEqual([
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "upsert", id: "async-complete", title: "reviewer", status: "running" },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "upsert", id: "async-failed", title: "worker", status: "running" },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "upsert", id: "async-canceled", title: "writer", status: "running" },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "upsert", id: "async-complete", status: "completed" },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "upsert", id: "async-failed", status: "failed" },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "upsert", id: "async-canceled", status: "canceled" },
+      },
+    ]);
+    expect(events.timelineItems()).toEqual([]);
 
     await session.close();
   });

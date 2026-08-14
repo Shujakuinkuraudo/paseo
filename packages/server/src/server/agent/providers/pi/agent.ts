@@ -95,6 +95,7 @@ const PASEO_PI_CAPTURE_EXTENSION_COMMAND = "paseo_capture_entries";
 const PASEO_PI_ENTRY_CAPTURE_MARKER = "PASEO_ENTRY_CAPTURE";
 const PASEO_PI_SUBMITTED_USER_ENTRY_MARKER = "PASEO_SUBMITTED_USER_ENTRY";
 const PASEO_PI_COMMAND_RESULT_MARKER = "PASEO_COMMAND_RESULT";
+const PASEO_PI_SUBAGENT_MARKER = "PASEO_PI_SUBAGENT";
 const DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS = 30_000;
 const QUESTION_RESPONSE_HEADER = "Response";
 const QUESTION_COMMENT_HEADER = "Comment";
@@ -109,6 +110,16 @@ export const PiProviderParamsSchema = z
   .strict();
 
 type PiProviderParams = z.infer<typeof PiProviderParamsSchema>;
+
+const PiSubagentMarkerSchema = z.object({
+  version: z.literal(1),
+  kind: z.enum(["started", "completed"]),
+  id: z.string().trim().min(1),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+  agent: z.string().trim().min(1).optional(),
+});
+
+type PiSubagentMarker = z.infer<typeof PiSubagentMarkerSchema>;
 
 const PI_HANDLED_BUILTIN_SLASH_COMMANDS: AgentSlashCommand[] = [
   {
@@ -675,8 +686,60 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	  );
 	}
 
+	function resolveSubagentStatus(kind, payload) {
+	  if (kind === "started") {
+	    return "running";
+	  }
+	  if (
+	    payload.stopped === true ||
+	    payload.interrupted === true ||
+	    payload.state === "stopped"
+	  ) {
+	    return "canceled";
+	  }
+	  if (payload.state === "paused") {
+	    return "running";
+	  }
+	  if (
+	    payload.success === false ||
+	    payload.state === "failed" ||
+	    payload.timedOut === true ||
+	    payload.turnBudgetExceeded === true
+	  ) {
+	    return "failed";
+	  }
+	  return "completed";
+	}
+
+	function emitSubagentEvent(ctx, kind, payload) {
+	  if (!payload || typeof payload !== "object") {
+	    return;
+	  }
+	  const rawId = typeof payload.id === "string" ? payload.id : payload.runId;
+	  if (typeof rawId !== "string") {
+	    return;
+	  }
+	  const id = rawId.trim();
+	  if (!id) {
+	    return;
+	  }
+	  const agent = typeof payload.agent === "string" ? payload.agent.trim() : "";
+	  ctx.ui.notify(
+	    "${PASEO_PI_SUBAGENT_MARKER} " +
+	      JSON.stringify({
+	        version: 1,
+	        kind,
+	        id,
+	        status: resolveSubagentStatus(kind, payload),
+	        ...(agent ? { agent } : {}),
+	      }),
+	    "info",
+	  );
+	}
+
 	export default function paseoIntegration(pi) {
 	  const submittedUserMessages = [];
+	  let activeContext;
 
 	  function emitSubmittedUserEntries(ctx) {
 	    const entries = ctx.sessionManager.getEntries();
@@ -709,7 +772,24 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
     }
 
 	  pi.on("session_start", async (_event, ctx) => {
+	    activeContext = ctx;
 	    emitEntryCapture(ctx, "session_start");
+	  });
+
+	  pi.on("session_shutdown", async () => {
+	    activeContext = undefined;
+	  });
+
+	  pi.events.on("subagent:async-started", (payload) => {
+	    if (activeContext) {
+	      emitSubagentEvent(activeContext, "started", payload);
+	    }
+	  });
+
+	  pi.events.on("subagent:async-complete", (payload) => {
+	    if (activeContext) {
+	      emitSubagentEvent(activeContext, "completed", payload);
+	    }
 	  });
 
 	  pi.on("message_end", async (event) => {
@@ -1928,6 +2008,30 @@ export class PiRpcAgentSession implements AgentSession {
     return true;
   }
 
+  private handlePiSubagentMarker(message: string): boolean {
+    const prefix = `${PASEO_PI_SUBAGENT_MARKER} `;
+    if (!message.startsWith(prefix)) {
+      return false;
+    }
+    const payload = parseExtensionMarkerPayload(message, PASEO_PI_SUBAGENT_MARKER);
+    const parsed = PiSubagentMarkerSchema.safeParse(payload);
+    if (!parsed.success) {
+      return true;
+    }
+    const marker: PiSubagentMarker = parsed.data;
+    this.emit({
+      type: "provider_subagent",
+      provider: this.provider,
+      event: {
+        type: "upsert",
+        id: marker.id,
+        status: marker.status,
+        ...(marker.agent ? { title: marker.agent } : {}),
+      },
+    });
+    return true;
+  }
+
   private handleExtensionUiRequest(
     event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
   ): void {
@@ -1936,7 +2040,8 @@ export class PiRpcAgentSession implements AgentSession {
       if (
         this.handleSubmittedUserEntryMarker(message) ||
         this.handleEntryCaptureMarker(message) ||
-        this.handleCommandResultMarker(message)
+        this.handleCommandResultMarker(message) ||
+        this.handlePiSubagentMarker(message)
       ) {
         return;
       }
