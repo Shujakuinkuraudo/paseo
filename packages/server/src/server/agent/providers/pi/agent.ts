@@ -1030,6 +1030,7 @@ function isPiAgentSessionEvent(event: PiRuntimeEvent): event is PiAgentSessionEv
     case "compaction_start":
     case "compaction_end":
     case "agent_end":
+    case "agent_settled":
       return true;
     default:
       return false;
@@ -1240,6 +1241,9 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly capturedUserEntries: PiCapturedEntry[] = [];
   private readonly capturedUserEntriesById = new Map<string, PiCapturedEntry>();
   private readonly pendingExtensionResults = new Map<string, PendingExtensionResult>();
+  private activeAgentLifecycleTurnId: string | null = null;
+  private pendingAgentEnd: { turnId: string; messages: PiAgentMessage[] } | null = null;
+  private piRetryAttempt = 0;
   private outOfBandCompactionEmit: ((event: AgentStreamEvent) => void) | null = null;
   private outOfBandCompactionStarted = false;
   private outOfBandCompactionCompleted = false;
@@ -1305,6 +1309,9 @@ export class PiRpcAgentSession implements AgentSession {
     this.activeClientMessageId = options?.clientMessageId ?? null;
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;
+    this.activeAgentLifecycleTurnId = null;
+    this.pendingAgentEnd = null;
+    this.piRetryAttempt = 0;
     this.activePromptRequestId = null;
     this.clearNoTurnBuffers();
     this.activeNoTurnPromptText = payload.text;
@@ -1335,6 +1342,9 @@ export class PiRpcAgentSession implements AgentSession {
         this.activeTurnId = null;
         this.activeClientMessageId = null;
         this.activeTurnStarted = false;
+        this.activeAgentLifecycleTurnId = null;
+        this.pendingAgentEnd = null;
+        this.piRetryAttempt = 0;
         this.activeAssistantMessageId = null;
         this.clearNoTurnBuffers();
         if (isPiRequestAbortError(error)) {
@@ -1459,6 +1469,8 @@ export class PiRpcAgentSession implements AgentSession {
       if (this.interruptedTerminalError?.turnId === turnId) {
         const terminalError = this.interruptedTerminalError;
         this.interruptedTerminalError = null;
+        this.pendingAgentEnd = null;
+        this.activeAgentLifecycleTurnId = null;
         this.activeTurnId = null;
         this.activeClientMessageId = null;
         this.activeTurnStarted = false;
@@ -1475,6 +1487,8 @@ export class PiRpcAgentSession implements AgentSession {
     }
     if (turnId && this.activeTurnId === turnId) {
       this.activeTurnId = null;
+      this.pendingAgentEnd = null;
+      this.activeAgentLifecycleTurnId = null;
       this.activeClientMessageId = null;
       this.activeTurnStarted = false;
       this.activeAssistantMessageId = null;
@@ -2050,6 +2064,9 @@ export class PiRpcAgentSession implements AgentSession {
     this.activeTurnId = null;
     this.activeClientMessageId = null;
     this.activeTurnStarted = false;
+    this.activeAgentLifecycleTurnId = null;
+    this.pendingAgentEnd = null;
+    this.piRetryAttempt = 0;
     this.clearNoTurnBuffers();
     this.emit({
       type: "turn_failed",
@@ -2064,8 +2081,11 @@ export class PiRpcAgentSession implements AgentSession {
 
     switch (event.type) {
       case "agent_start":
-        this.activeTurnStarted = true;
-        this.clearNoTurnBuffers();
+        if (this.activeTurnId) {
+          this.activeTurnStarted = true;
+          this.activeAgentLifecycleTurnId = this.activeTurnId;
+          this.clearNoTurnBuffers();
+        }
         this.emit({
           type: "thread_started",
           provider: this.provider,
@@ -2073,8 +2093,11 @@ export class PiRpcAgentSession implements AgentSession {
         });
         return;
       case "turn_start":
-        this.activeTurnStarted = true;
-        this.clearNoTurnBuffers();
+        if (this.activeTurnId) {
+          this.activeTurnStarted = true;
+          this.activeAgentLifecycleTurnId = this.activeTurnId;
+          this.clearNoTurnBuffers();
+        }
         this.emit({
           type: "turn_started",
           provider: this.provider,
@@ -2132,11 +2155,63 @@ export class PiRpcAgentSession implements AgentSession {
         });
         return;
       case "agent_end":
-        this.completeTurn(turnId, event.messages ?? []);
+        this.handleAgentEnd(event);
+        return;
+      case "agent_settled":
+        this.handleAgentSettled();
         return;
       default:
         return;
     }
+  }
+
+  private handleAgentEnd(event: Extract<PiAgentSessionEvent, { type: "agent_end" }>): void {
+    const lifecycleTurnId = this.activeAgentLifecycleTurnId;
+    if (!lifecycleTurnId || lifecycleTurnId !== this.activeTurnId) {
+      return;
+    }
+    // COMPAT(piAgentSettled): preserve Pi <=0.83 behavior; remove after 2027-02-07 once the
+    // supported Pi floor is >=0.84. Pi 0.84+ includes willRetry and agent_settled.
+    if (event.willRetry === undefined) {
+      this.completeTurn(lifecycleTurnId, event.messages ?? []);
+      return;
+    }
+    const messages = event.messages ?? [];
+    if (event.willRetry) {
+      this.piRetryAttempt += 1;
+      const errorMessage = latestPiErrorMessage(messages);
+      this.emit({
+        type: "timeline",
+        provider: this.provider,
+        turnId: lifecycleTurnId,
+        item: {
+          type: "error",
+          message: errorMessage
+            ? `Provider retry (attempt ${this.piRetryAttempt}): ${errorMessage}`
+            : `Provider retry (attempt ${this.piRetryAttempt})`,
+        },
+      });
+    }
+    this.pendingAgentEnd = {
+      turnId: lifecycleTurnId,
+      messages,
+    };
+  }
+
+  private handleAgentSettled(): void {
+    const pendingAgentEnd = this.pendingAgentEnd;
+    if (!pendingAgentEnd) {
+      return;
+    }
+    if (
+      pendingAgentEnd.turnId !== this.activeTurnId ||
+      pendingAgentEnd.turnId !== this.activeAgentLifecycleTurnId
+    ) {
+      this.pendingAgentEnd = null;
+      return;
+    }
+    this.pendingAgentEnd = null;
+    this.completeTurn(pendingAgentEnd.turnId, pendingAgentEnd.messages);
   }
 
   private handleToolExecutionEnd(
@@ -2304,6 +2379,9 @@ export class PiRpcAgentSession implements AgentSession {
       this.lastInterruptedTurnId = null;
       return;
     }
+    this.pendingAgentEnd = null;
+    this.piRetryAttempt = 0;
+    this.activeAgentLifecycleTurnId = null;
     this.activeTurnId = null;
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;
