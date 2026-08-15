@@ -38,7 +38,6 @@ interface ProviderSubagentState {
     serverId: string,
     parentAgentId: string,
     subagents: ProviderSubagentDescriptorPayload[],
-    protectedDescriptorKeys?: ReadonlySet<string>,
   ): void;
   applyUpdate(
     serverId: string,
@@ -73,188 +72,34 @@ export function providerSubagentLifecycleStatus(
 }
 
 type ProviderSubagentListClient = Pick<DaemonClient, "listProviderSubagents">;
-type ProviderSubagentRefreshClient = ProviderSubagentListClient &
-  Pick<DaemonClient, "subscribeConnectionStatus">;
 
-interface ProviderSubagentRefreshState {
-  liveUpdateVersion: number;
-  liveDescriptorUpdateVersions: Map<string, number>;
-  latestListGeneration: number;
-  pendingRequestCount: number;
-}
-
-interface PendingProviderSubagentListRequest {
-  promise: Promise<void>;
-  allowsUnguardedApply: boolean;
-  applyGuards: Set<() => boolean>;
-}
-
-interface RefreshProviderSubagentsOptions {
-  shouldApply?: () => boolean;
-}
-
-const pendingListRequests = new WeakMap<
-  ProviderSubagentListClient,
-  Map<string, PendingProviderSubagentListRequest>
->();
-const providerSubagentRefreshStates = new Map<string, ProviderSubagentRefreshState>();
-
-function providerSubagentParentKey(serverId: string, parentAgentId: string): string {
-  return `${serverId}\0${parentAgentId}`;
-}
-
-function noteLiveProviderSubagentUpdate(
-  serverId: string,
-  parentAgentId: string,
-  subagentId: string,
-): void {
-  const refreshState = providerSubagentRefreshStates.get(
-    providerSubagentParentKey(serverId, parentAgentId),
-  );
-  if (refreshState) {
-    refreshState.liveUpdateVersion += 1;
-    refreshState.liveDescriptorUpdateVersions.set(
-      providerSubagentKey(serverId, parentAgentId, subagentId),
-      refreshState.liveUpdateVersion,
-    );
-  }
-}
-
-function addPendingListConsumer(
-  pending: PendingProviderSubagentListRequest,
-  options: RefreshProviderSubagentsOptions,
-): void {
-  if (options.shouldApply) {
-    pending.applyGuards.add(options.shouldApply);
-  } else {
-    pending.allowsUnguardedApply = true;
-  }
-}
-
-function hasPendingListConsumer(pending: PendingProviderSubagentListRequest): boolean {
-  return (
-    pending.allowsUnguardedApply || [...pending.applyGuards].some((shouldApply) => shouldApply())
-  );
-}
+const pendingListRequests = new WeakMap<ProviderSubagentListClient, Map<string, Promise<void>>>();
 
 export function refreshProviderSubagents(
   client: ProviderSubagentListClient,
   serverId: string,
   parentAgentId: string,
-  options: RefreshProviderSubagentsOptions = {},
 ): Promise<void> {
-  const requestKey = providerSubagentParentKey(serverId, parentAgentId);
+  const requestKey = `${serverId}\0${parentAgentId}`;
   let clientRequests = pendingListRequests.get(client);
   if (!clientRequests) {
     clientRequests = new Map();
     pendingListRequests.set(client, clientRequests);
   }
   const pending = clientRequests.get(requestKey);
-  if (pending) {
-    addPendingListConsumer(pending, options);
-    return pending.promise;
-  }
-
-  const refreshState = providerSubagentRefreshStates.get(requestKey) ?? {
-    liveUpdateVersion: 0,
-    liveDescriptorUpdateVersions: new Map<string, number>(),
-    latestListGeneration: 0,
-    pendingRequestCount: 0,
-  };
-  providerSubagentRefreshStates.set(requestKey, refreshState);
-  const liveUpdateVersion = refreshState.liveUpdateVersion;
-  const listGeneration = refreshState.latestListGeneration + 1;
-  refreshState.latestListGeneration = listGeneration;
-  refreshState.pendingRequestCount += 1;
-  const pendingRequest: PendingProviderSubagentListRequest = {
-    promise: Promise.resolve(),
-    allowsUnguardedApply: options.shouldApply === undefined,
-    applyGuards: new Set(options.shouldApply ? [options.shouldApply] : []),
-  };
+  if (pending) return pending;
 
   const request = client
     .listProviderSubagents(parentAgentId)
     .then((payload) => {
-      const currentRefreshState = providerSubagentRefreshStates.get(requestKey);
-      if (
-        !currentRefreshState ||
-        currentRefreshState.latestListGeneration !== listGeneration ||
-        !hasPendingListConsumer(pendingRequest)
-      ) {
-        return undefined;
-      }
-      const protectedDescriptorKeys = new Set(
-        [...currentRefreshState.liveDescriptorUpdateVersions]
-          .filter(([, updateVersion]) => updateVersion > liveUpdateVersion)
-          .map(([key]) => key),
-      );
-      useProviderSubagentStore
-        .getState()
-        .replaceList(serverId, parentAgentId, payload.subagents, protectedDescriptorKeys);
+      useProviderSubagentStore.getState().replaceList(serverId, parentAgentId, payload.subagents);
       return undefined;
     })
     .finally(() => {
-      if (clientRequests?.get(requestKey) === pendingRequest) {
-        clientRequests.delete(requestKey);
-      }
-      refreshState.pendingRequestCount -= 1;
-      if (
-        refreshState.pendingRequestCount === 0 &&
-        providerSubagentRefreshStates.get(requestKey) === refreshState
-      ) {
-        providerSubagentRefreshStates.delete(requestKey);
-      }
+      clientRequests?.delete(requestKey);
     });
-  pendingRequest.promise = request;
-  clientRequests.set(requestKey, pendingRequest);
+  clientRequests.set(requestKey, request);
   return request;
-}
-
-export function subscribeProviderSubagentRefresh(
-  client: ProviderSubagentRefreshClient,
-  serverId: string,
-  parentAgentId: string,
-): () => void {
-  let active = true;
-  let refreshQueued = false;
-  let refreshInFlight = false;
-  let observedConnectionState = false;
-
-  const scheduleRefresh = () => {
-    if (!active) {
-      return;
-    }
-    refreshQueued = true;
-    if (refreshInFlight) {
-      return;
-    }
-    refreshInFlight = true;
-    void (async () => {
-      while (refreshQueued) {
-        if (!active) {
-          break;
-        }
-        refreshQueued = false;
-        await refreshProviderSubagents(client, serverId, parentAgentId, {
-          shouldApply: () => active,
-        }).catch(() => undefined);
-      }
-      refreshInFlight = false;
-    })();
-  };
-
-  scheduleRefresh();
-  const unsubscribe = client.subscribeConnectionStatus((connection) => {
-    const isInitialState = !observedConnectionState;
-    observedConnectionState = true;
-    if (!isInitialState && connection.status === "connected") {
-      scheduleRefresh();
-    }
-  });
-  return () => {
-    active = false;
-    unsubscribe();
-  };
 }
 
 function parentPrefix(serverId: string, parentAgentId: string): string {
@@ -363,20 +208,15 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
       return { hiddenFromTrack };
     });
   },
-  replaceList(serverId, parentAgentId, subagents, protectedDescriptorKeys = new Set<string>()) {
+  replaceList(serverId, parentAgentId, subagents) {
     set((state) => {
       const prefix = parentPrefix(serverId, parentAgentId);
       const descriptors = new Map(
-        [...state.descriptors].filter(
-          ([key]) => !key.startsWith(prefix) || protectedDescriptorKeys.has(key),
-        ),
+        [...state.descriptors].filter(([key]) => !key.startsWith(prefix)),
       );
       const hiddenFromTrack = new Set(state.hiddenFromTrack);
       for (const subagent of subagents) {
         const key = providerSubagentKey(serverId, parentAgentId, subagent.id);
-        if (protectedDescriptorKeys.has(key)) {
-          continue;
-        }
         descriptors.set(key, subagent);
         if (subagent.status === "running") {
           hiddenFromTrack.delete(key);
@@ -388,9 +228,6 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
       );
       for (const subagent of subagents) {
         const key = providerSubagentKey(serverId, parentAgentId, subagent.id);
-        if (protectedDescriptorKeys.has(key)) {
-          continue;
-        }
         const current = timelines.get(key);
         const previous = state.descriptors.get(key);
         if (current && previous?.status !== subagent.status) {
@@ -406,11 +243,6 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
   applyUpdate(serverId, payload) {
     set((state) => {
       if (payload.kind === "upsert") {
-        noteLiveProviderSubagentUpdate(
-          serverId,
-          payload.subagent.parentAgentId,
-          payload.subagent.id,
-        );
         const key = providerSubagentKey(
           serverId,
           payload.subagent.parentAgentId,
@@ -435,7 +267,6 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
         return { descriptors, timelines, hiddenFromTrack };
       }
       if (payload.kind === "remove") {
-        noteLiveProviderSubagentUpdate(serverId, payload.parentAgentId, payload.subagentId);
         const key = providerSubagentKey(serverId, payload.parentAgentId, payload.subagentId);
         const descriptors = new Map(state.descriptors);
         descriptors.delete(key);

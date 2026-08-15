@@ -1580,7 +1580,39 @@ export class Session {
 
         if (event.type === "provider_subagent") {
           this.emitProviderSubagentWorkspaceUpdate(event.event);
-          this.emitProviderSubagentUpdate(event.event);
+          if (!this.supports(CLIENT_CAPS.providerSubagents)) {
+            return;
+          }
+          const update = event.event;
+          if (update.type === "upsert") {
+            this.emit({
+              type: "agent.provider_subagents.update",
+              payload: { kind: "upsert", subagent: update.subagent },
+            });
+          } else if (update.type === "timeline") {
+            this.emit({
+              type: "agent.provider_subagents.update",
+              payload: {
+                kind: "timeline",
+                parentAgentId: update.parentAgentId,
+                subagentId: update.subagentId,
+                provider: update.provider,
+                item: update.row.item,
+                timestamp: update.row.timestamp,
+                seq: update.row.seq,
+                epoch: update.epoch,
+              },
+            });
+          } else {
+            this.emit({
+              type: "agent.provider_subagents.update",
+              payload: {
+                kind: "remove",
+                parentAgentId: update.parentAgentId,
+                subagentId: update.subagentId,
+              },
+            });
+          }
           return;
         }
 
@@ -1647,62 +1679,6 @@ export class Session {
       },
       { replayState: false },
     );
-  }
-
-  private emitProviderSubagentUpdate(event: ProviderSubagentManagerEvent): void {
-    let message: Extract<SessionOutboundMessage, { type: "agent.provider_subagents.update" }>;
-    if (event.type === "upsert") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: { kind: "upsert", subagent: event.subagent },
-      };
-    } else if (event.type === "timeline") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "timeline",
-          parentAgentId: event.parentAgentId,
-          subagentId: event.subagentId,
-          provider: event.provider,
-          item: event.row.item,
-          timestamp: event.row.timestamp,
-          seq: event.row.seq,
-          epoch: event.epoch,
-        },
-      };
-    } else {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "remove",
-          parentAgentId: event.parentAgentId,
-          subagentId: event.subagentId,
-        },
-      };
-    }
-
-    if (this.clientCapabilitiesBySource.size === 0) {
-      if (this.supports(CLIENT_CAPS.providerSubagents)) {
-        this.emit(message);
-      }
-      return;
-    }
-
-    if (!this.onMessageToSource) {
-      const allSourcesSupportProviderSubagents = [
-        ...this.clientCapabilitiesBySource.values(),
-      ].every((capabilities) => capabilities.has(CLIENT_CAPS.providerSubagents));
-      if (allSourcesSupportProviderSubagents) {
-        this.emit(message);
-      }
-      return;
-    }
-
-    for (const [source, capabilities] of this.clientCapabilitiesBySource) {
-      if (capabilities.has(CLIENT_CAPS.providerSubagents)) {
-        this.onMessageToSource(source, message);
-      }
-    }
   }
 
   private emitProviderSubagentWorkspaceUpdate(event: ProviderSubagentManagerEvent): void {
@@ -1969,9 +1945,9 @@ export class Session {
       case "agent.timeline.list_prompts.request":
         return this.handleAgentTimelineListPromptsRequest(msg, source);
       case "agent.provider_subagents.list.request":
-        return this.handleProviderSubagentListRequest(msg, source);
+        return this.handleProviderSubagentListRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
-        return this.handleProviderSubagentTimelineRequest(msg, source);
+        return this.handleProviderSubagentTimelineRequest(msg);
       case "agent.timeline.set_subscription.request": {
         const agentIds = [...new Set(msg.agentIds)].sort();
         if (
@@ -6607,7 +6583,6 @@ export class Session {
 
   private async handleProviderSubagentListRequest(
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.list.request" }>,
-    source?: object,
   ): Promise<void> {
     try {
       await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
@@ -6615,37 +6590,30 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
-      this.emitForSource(
-        {
-          type: "agent.provider_subagents.list.response",
-          payload: {
-            requestId: msg.requestId,
-            parentAgentId: msg.parentAgentId,
-            subagents: this.agentManager.listProviderSubagents(msg.parentAgentId),
-            error: null,
-          },
+      this.emit({
+        type: "agent.provider_subagents.list.response",
+        payload: {
+          requestId: msg.requestId,
+          parentAgentId: msg.parentAgentId,
+          subagents: this.agentManager.listProviderSubagents(msg.parentAgentId),
+          error: null,
         },
-        source,
-      );
+      });
     } catch (error) {
-      this.emitForSource(
-        {
-          type: "agent.provider_subagents.list.response",
-          payload: {
-            requestId: msg.requestId,
-            parentAgentId: msg.parentAgentId,
-            subagents: [],
-            error: error instanceof Error ? error.message : String(error),
-          },
+      this.emit({
+        type: "agent.provider_subagents.list.response",
+        payload: {
+          requestId: msg.requestId,
+          parentAgentId: msg.parentAgentId,
+          subagents: [],
+          error: error instanceof Error ? error.message : String(error),
         },
-        source,
-      );
+      });
     }
   }
 
   private async handleProviderSubagentTimelineRequest(
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.timeline.get.request" }>,
-    source?: object,
   ): Promise<void> {
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     try {
@@ -6667,55 +6635,49 @@ export class Session {
           limit: msg.limit ?? (direction === "after" ? 0 : 200),
         },
       );
-      this.emitForSource(
-        {
-          type: "agent.provider_subagents.timeline.get.response",
-          payload: {
-            requestId: msg.requestId,
-            parentAgentId: msg.parentAgentId,
-            subagentId: msg.subagentId,
-            provider: descriptor.provider,
-            direction,
-            epoch: timeline.epoch,
-            reset: timeline.reset,
-            staleCursor: timeline.staleCursor,
-            gap: timeline.gap,
-            window: timeline.window,
-            hasOlder: timeline.hasOlder,
-            hasNewer: timeline.hasNewer,
-            rows: timeline.rows.map((row) => ({
-              item: row.item,
-              timestamp: row.timestamp,
-              seq: row.seq,
-            })),
-            error: null,
-          },
+      this.emit({
+        type: "agent.provider_subagents.timeline.get.response",
+        payload: {
+          requestId: msg.requestId,
+          parentAgentId: msg.parentAgentId,
+          subagentId: msg.subagentId,
+          provider: descriptor.provider,
+          direction,
+          epoch: timeline.epoch,
+          reset: timeline.reset,
+          staleCursor: timeline.staleCursor,
+          gap: timeline.gap,
+          window: timeline.window,
+          hasOlder: timeline.hasOlder,
+          hasNewer: timeline.hasNewer,
+          rows: timeline.rows.map((row) => ({
+            item: row.item,
+            timestamp: row.timestamp,
+            seq: row.seq,
+          })),
+          error: null,
         },
-        source,
-      );
+      });
     } catch (error) {
-      this.emitForSource(
-        {
-          type: "agent.provider_subagents.timeline.get.response",
-          payload: {
-            requestId: msg.requestId,
-            parentAgentId: msg.parentAgentId,
-            subagentId: msg.subagentId,
-            provider: null,
-            direction,
-            epoch: "",
-            reset: false,
-            staleCursor: false,
-            gap: false,
-            window: { minSeq: 0, maxSeq: 0, nextSeq: 0 },
-            hasOlder: false,
-            hasNewer: false,
-            rows: [],
-            error: error instanceof Error ? error.message : String(error),
-          },
+      this.emit({
+        type: "agent.provider_subagents.timeline.get.response",
+        payload: {
+          requestId: msg.requestId,
+          parentAgentId: msg.parentAgentId,
+          subagentId: msg.subagentId,
+          provider: null,
+          direction,
+          epoch: "",
+          reset: false,
+          staleCursor: false,
+          gap: false,
+          window: { minSeq: 0, maxSeq: 0, nextSeq: 0 },
+          hasOlder: false,
+          hasNewer: false,
+          rows: [],
+          error: error instanceof Error ? error.message : String(error),
         },
-        source,
-      );
+      });
     }
   }
 
