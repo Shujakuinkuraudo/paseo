@@ -1,5 +1,10 @@
-import { afterEach, describe, expect, test } from "vitest";
-import { providerSubagentKey, useProviderSubagentStore } from "./provider-store";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import {
+  providerSubagentKey,
+  refreshProviderSubagents,
+  subscribeProviderSubagentRefresh,
+  useProviderSubagentStore,
+} from "./provider-store";
 
 const SERVER_ID = "server-1";
 const PARENT_ID = "parent-1";
@@ -14,6 +19,306 @@ afterEach(() => {
 });
 
 describe("provider subagent client store", () => {
+  test("refreshes a visible parent after the client reconnects", async () => {
+    const runningSubagent = {
+      id: SUBAGENT_ID,
+      parentAgentId: PARENT_ID,
+      provider: "pi" as const,
+      title: "Running worker",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-07-12T10:00:00.000Z",
+      updatedAt: "2026-07-12T10:00:00.000Z",
+      toolCallId: null,
+      cwd: null,
+      subtitle: null,
+    };
+    let resolveFirstResponse: () => void = () => {
+      throw new Error("First response resolver was not initialized");
+    };
+    const firstResponse = new Promise<{ subagents: unknown[] }>((resolve) => {
+      resolveFirstResponse = () => resolve({ subagents: [] });
+    });
+    const listProviderSubagents = vi.fn(() => {
+      if (listProviderSubagents.mock.calls.length === 1) {
+        return firstResponse;
+      }
+      return Promise.resolve({ subagents: [runningSubagent] });
+    });
+    let connectionListener: (state: { status: string }) => void = (_state) => {
+      throw new Error("Connection listener was not initialized");
+    };
+    const client = {
+      listProviderSubagents,
+      subscribeConnectionStatus(listener: (state: { status: string }) => void) {
+        connectionListener = listener;
+        listener({ status: "connected" });
+        return () => {
+          connectionListener = () => {
+            throw new Error("Connection listener was unsubscribed");
+          };
+        };
+      },
+    } as unknown as Parameters<typeof subscribeProviderSubagentRefresh>[0];
+
+    const unsubscribe = subscribeProviderSubagentRefresh(client, SERVER_ID, PARENT_ID);
+    await vi.waitFor(() => expect(listProviderSubagents).toHaveBeenCalledTimes(1));
+
+    connectionListener({ status: "disconnected" });
+    connectionListener({ status: "connected" });
+    resolveFirstResponse();
+    await vi.waitFor(() => expect(listProviderSubagents).toHaveBeenCalledTimes(2));
+
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID))?.status,
+    ).toBe("running");
+    unsubscribe();
+  });
+
+  test("does not apply a list response after its subscription is cleaned up", async () => {
+    let resolveListResponse!: (value: { subagents: unknown[] }) => void;
+    const listResponse = new Promise<{ subagents: unknown[] }>((resolve) => {
+      resolveListResponse = resolve;
+    });
+    const unsubscribeConnectionStatus = vi.fn();
+    const client = {
+      listProviderSubagents: vi.fn(() => listResponse),
+      subscribeConnectionStatus(listener: (state: { status: string }) => void) {
+        listener({ status: "connected" });
+        return unsubscribeConnectionStatus;
+      },
+    } as unknown as Parameters<typeof subscribeProviderSubagentRefresh>[0];
+    const unsubscribe = subscribeProviderSubagentRefresh(client, SERVER_ID, PARENT_ID);
+    await vi.waitFor(() => expect(client.listProviderSubagents).toHaveBeenCalledTimes(1));
+
+    unsubscribe();
+    resolveListResponse({
+      subagents: [
+        {
+          id: SUBAGENT_ID,
+          parentAgentId: PARENT_ID,
+          provider: "pi",
+          title: "Running worker",
+          description: null,
+          status: "running",
+          createdAt: "2026-07-12T10:00:00.000Z",
+          updatedAt: "2026-07-12T10:00:01.000Z",
+          toolCallId: null,
+          cwd: null,
+          subtitle: null,
+        },
+      ],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(unsubscribeConnectionStatus).toHaveBeenCalledTimes(1);
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID)),
+    ).toBeUndefined();
+  });
+
+  test("merges a newer live update with sibling rows from an older list response", async () => {
+    let resolveListResponse!: (value: { subagents: unknown[] }) => void;
+    const listResponse = new Promise<{ subagents: unknown[] }>((resolve) => {
+      resolveListResponse = resolve;
+    });
+    const client = {
+      listProviderSubagents: vi.fn(() => listResponse),
+    } as unknown as Parameters<typeof refreshProviderSubagents>[0];
+    const refresh = refreshProviderSubagents(client, SERVER_ID, PARENT_ID);
+
+    useProviderSubagentStore.getState().applyUpdate(SERVER_ID, {
+      kind: "upsert",
+      subagent: {
+        id: SUBAGENT_ID,
+        parentAgentId: PARENT_ID,
+        provider: "pi",
+        title: "Running worker",
+        description: null,
+        status: "running",
+        createdAt: "2026-07-12T10:00:00.000Z",
+        updatedAt: "2026-07-12T10:00:01.000Z",
+        toolCallId: null,
+        cwd: null,
+        subtitle: null,
+      },
+    });
+    resolveListResponse({
+      subagents: [
+        {
+          id: "stable-worker",
+          parentAgentId: PARENT_ID,
+          provider: "pi",
+          title: "Stable worker",
+          description: null,
+          status: "running",
+          createdAt: "2026-07-12T09:00:00.000Z",
+          updatedAt: "2026-07-12T09:00:00.000Z",
+          toolCallId: null,
+          cwd: null,
+          subtitle: null,
+        },
+      ],
+    });
+    await refresh;
+
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID))?.status,
+    ).toBe("running");
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey(SERVER_ID, PARENT_ID, "stable-worker"))?.status,
+    ).toBe("running");
+  });
+
+  test("does not resurrect a descriptor removed during a list request", async () => {
+    const removedSubagent = {
+      id: SUBAGENT_ID,
+      parentAgentId: PARENT_ID,
+      provider: "pi" as const,
+      title: "Removed worker",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-07-12T10:00:00.000Z",
+      updatedAt: "2026-07-12T10:00:00.000Z",
+      toolCallId: null,
+      cwd: null,
+      subtitle: null,
+    };
+    useProviderSubagentStore.getState().applyUpdate(SERVER_ID, {
+      kind: "upsert",
+      subagent: removedSubagent,
+    });
+    let resolveListResponse!: (value: { subagents: unknown[] }) => void;
+    const listResponse = new Promise<{ subagents: unknown[] }>((resolve) => {
+      resolveListResponse = resolve;
+    });
+    const client = {
+      listProviderSubagents: vi.fn(() => listResponse),
+    } as unknown as Parameters<typeof refreshProviderSubagents>[0];
+    const refresh = refreshProviderSubagents(client, SERVER_ID, PARENT_ID);
+
+    useProviderSubagentStore.getState().applyUpdate(SERVER_ID, {
+      kind: "remove",
+      parentAgentId: PARENT_ID,
+      subagentId: SUBAGENT_ID,
+    });
+    resolveListResponse({ subagents: [removedSubagent] });
+    await refresh;
+
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID)),
+    ).toBeUndefined();
+  });
+
+  test("keeps a valid list response after a stale timeline update", async () => {
+    const store = useProviderSubagentStore.getState();
+    store.applyUpdate(SERVER_ID, {
+      kind: "timeline",
+      parentAgentId: PARENT_ID,
+      subagentId: SUBAGENT_ID,
+      provider: "pi",
+      epoch: "epoch-1",
+      seq: 1,
+      timestamp: "2026-07-12T10:00:00.000Z",
+      item: { type: "assistant_message", text: "Live output" },
+    });
+    let resolveListResponse!: (value: { subagents: unknown[] }) => void;
+    const listResponse = new Promise<{ subagents: unknown[] }>((resolve) => {
+      resolveListResponse = resolve;
+    });
+    const client = {
+      listProviderSubagents: vi.fn(() => listResponse),
+    } as unknown as Parameters<typeof refreshProviderSubagents>[0];
+    const refresh = refreshProviderSubagents(client, SERVER_ID, PARENT_ID);
+
+    store.applyUpdate(SERVER_ID, {
+      kind: "timeline",
+      parentAgentId: PARENT_ID,
+      subagentId: SUBAGENT_ID,
+      provider: "pi",
+      epoch: "epoch-1",
+      seq: 1,
+      timestamp: "2026-07-12T10:00:00.000Z",
+      item: { type: "assistant_message", text: "Duplicate output" },
+    });
+    resolveListResponse({
+      subagents: [
+        {
+          id: SUBAGENT_ID,
+          parentAgentId: PARENT_ID,
+          provider: "pi",
+          title: "Running worker",
+          description: null,
+          status: "running",
+          createdAt: "2026-07-12T10:00:00.000Z",
+          updatedAt: "2026-07-12T10:00:01.000Z",
+          toolCallId: null,
+          cwd: null,
+          subtitle: null,
+        },
+      ],
+    });
+    await refresh;
+
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID))?.status,
+    ).toBe("running");
+  });
+
+  test("does not let a previous client overwrite a newer client refresh", async () => {
+    let resolvePreviousResponse!: (value: { subagents: unknown[] }) => void;
+    const previousResponse = new Promise<{ subagents: unknown[] }>((resolve) => {
+      resolvePreviousResponse = resolve;
+    });
+    const previousClient = {
+      listProviderSubagents: vi.fn(() => previousResponse),
+    } as unknown as Parameters<typeof refreshProviderSubagents>[0];
+    const currentClient = {
+      listProviderSubagents: vi.fn(() =>
+        Promise.resolve({
+          subagents: [
+            {
+              id: SUBAGENT_ID,
+              parentAgentId: PARENT_ID,
+              provider: "pi" as const,
+              title: "Running worker",
+              description: null,
+              status: "running" as const,
+              createdAt: "2026-07-12T10:00:00.000Z",
+              updatedAt: "2026-07-12T10:00:01.000Z",
+              toolCallId: null,
+              cwd: null,
+              subtitle: null,
+            },
+          ],
+        }),
+      ),
+    } as unknown as Parameters<typeof refreshProviderSubagents>[0];
+
+    const previousRefresh = refreshProviderSubagents(previousClient, SERVER_ID, PARENT_ID);
+    await refreshProviderSubagents(currentClient, SERVER_ID, PARENT_ID);
+    resolvePreviousResponse({ subagents: [] });
+    await previousRefresh;
+
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID))?.status,
+    ).toBe("running");
+  });
+
   test("builds a shared stream model from ordered provider updates", () => {
     const subagents = useProviderSubagentStore.getState();
     subagents.applyUpdate(SERVER_ID, {
